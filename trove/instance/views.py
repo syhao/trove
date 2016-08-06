@@ -92,12 +92,18 @@ class InstanceDetailView(InstanceView):
         result['instance']['datastore']['version'] = (self.instance.
                                                       datastore_version.name)
 
+        if self.instance.fault:
+            result['instance']['fault'] = self._build_fault_info()
+
         if self.instance.slaves:
             result['instance']['replicas'] = self._build_slaves_info()
 
         if self.instance.configuration is not None:
             result['instance']['configuration'] = (self.
                                                    _build_configuration_info())
+
+        if self.instance.locality:
+            result['instance']['locality'] = self.instance.locality
 
         if (isinstance(self.instance, models.DetailInstance) and
                 self.instance.volume_used):
@@ -118,6 +124,13 @@ class InstanceDetailView(InstanceView):
             result['instance']['shard_id'] = self.instance.shard_id
 
         return result
+
+    def _build_fault_info(self):
+        return {
+            "message": self.instance.fault.message,
+            "created": self.instance.fault.updated,
+            "details": self.instance.fault.details,
+        }
 
     def _build_slaves_info(self):
         data = []

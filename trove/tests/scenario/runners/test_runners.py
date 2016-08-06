@@ -30,6 +30,7 @@ from trove.common.utils import poll_until, build_polling_task
 from trove.tests.config import CONFIG
 from trove.tests.util.check import AttrCheck
 from trove.tests.util import create_dbaas_client
+from trove.tests.util import create_nova_client
 from trove.tests.util.users import Requirements
 
 CONF = cfg.CONF
@@ -71,17 +72,19 @@ class RunnerFactory(object):
             runner_module_name, class_prefix, runner_base_name,
             TEST_RUNNERS_NS)
         runner = runner_cls(*args, **kwargs)
-        runner._test_helper = cls._get_helper()
+        runner._test_helper = cls._get_helper(runner.report)
         return runner
 
     @classmethod
-    def _get_helper(cls):
+    def _get_helper(cls, report):
         class_prefix = cls._get_test_datastore()
         helper_cls = cls._load_dynamic_class(
             TEST_HELPER_MODULE_NAME, class_prefix,
             TEST_HELPER_BASE_NAME, TEST_HELPERS_NS)
-        return helper_cls(cls._build_class_name(
-            class_prefix, TEST_HELPER_BASE_NAME, strip_test=True))
+        return helper_cls(
+            cls._build_class_name(class_prefix,
+                                  TEST_HELPER_BASE_NAME, strip_test=True),
+            report)
 
     @classmethod
     def _get_test_datastore(cls):
@@ -150,10 +153,12 @@ class InstanceTestInfo(object):
         self.dbaas_flavor_href = None  # The flavor of the instance.
         self.dbaas_datastore = None  # The datastore id
         self.dbaas_datastore_version = None  # The datastore version id
+        self.volume_size = None  # The size of volume the instance will have.
         self.volume = None  # The volume the instance will have.
         self.nics = None  # The dict of type/id for nics used on the intance.
         self.user = None  # The user instance who owns the instance.
         self.users = None  # The users created on the instance.
+        self.databases = None  # The databases created on the instance.
 
 
 class TestRunner(object):
@@ -198,22 +203,26 @@ class TestRunner(object):
         self.def_timeout = timeout
 
         self.instance_info.name = "TEST_" + datetime.datetime.strftime(
-            datetime.datetime.now(), '%Y-%m-%d_%H:%M:%S')
+            datetime.datetime.now(), '%Y_%m_%d__%H_%M_%S')
         self.instance_info.dbaas_datastore = CONFIG.dbaas_datastore
         self.instance_info.dbaas_datastore_version = (
             CONFIG.dbaas_datastore_version)
         self.instance_info.user = CONFIG.users.find_user_by_name('alt_demo')
         if self.VOLUME_SUPPORT:
+            self.instance_info.volume_size = CONFIG.get('trove_volume_size', 1)
             self.instance_info.volume = {
-                'size': CONFIG.get('trove_volume_size', 1)}
+                'size': self.instance_info.volume_size}
         else:
+            self.instance_info.volume_size = None
             self.instance_info.volume = None
 
         self._auth_client = None
         self._unauth_client = None
         self._admin_client = None
         self._swift_client = None
+        self._nova_client = None
         self._test_helper = None
+        self._servers = {}
 
     @classmethod
     def fail(cls, message):
@@ -221,6 +230,13 @@ class TestRunner(object):
 
     @classmethod
     def assert_is_sublist(cls, sub_list, full_list, message=None):
+        if not message:
+            message = 'Unexpected sublist'
+        try:
+            message += ": sub_list '%s' (full_list '%s')." % (
+                sub_list, full_list)
+        except TypeError:
+            pass
         return cls.assert_true(set(sub_list).issubset(full_list), message)
 
     @classmethod
@@ -338,6 +354,12 @@ class TestRunner(object):
             auth_version='2.0',
             os_options=os_options)
 
+    @property
+    def nova_client(self):
+        if not self._nova_client:
+            self._nova_client = create_nova_client(self.instance_info.user)
+        return self._nova_client
+
     def get_client_tenant(self, client):
         tenant_name = client.real_client.client.tenant
         service_url = client.real_client.client.service_url
@@ -387,7 +409,7 @@ class TestRunner(object):
         return self.has_env_flag(self.DO_NOT_DELETE_INSTANCE_FLAG)
 
     def assert_instance_action(
-            self, instance_ids, expected_states, expected_http_code):
+            self, instance_ids, expected_states, expected_http_code=None):
         self.assert_client_code(expected_http_code)
         if expected_states:
             self.assert_all_instance_states(
@@ -400,11 +422,23 @@ class TestRunner(object):
             self.assert_equal(expected_http_code, client.last_http_code,
                               "Unexpected client status code")
 
-    def assert_all_instance_states(self, instance_ids, expected_states):
-        tasks = [build_polling_task(
-            lambda: self._assert_instance_states(instance_id, expected_states),
-            sleep_time=self.def_sleep_time, time_out=self.def_timeout)
-            for instance_id in instance_ids]
+    def assert_all_instance_states(self, instance_ids, expected_states,
+                                   fast_fail_status=None,
+                                   require_all_states=False):
+        self.report.log("Waiting for states (%s) for instances: %s" %
+                        (expected_states, instance_ids))
+
+        def _make_fn(inst_id):
+            return lambda: self._assert_instance_states(
+                inst_id, expected_states,
+                fast_fail_status=fast_fail_status,
+                require_all_states=require_all_states)
+
+        tasks = [
+            build_polling_task(
+                _make_fn(instance_id),
+                sleep_time=self.def_sleep_time,
+                time_out=self.def_timeout) for instance_id in instance_ids]
         poll_until(lambda: all(poll_task.ready() for poll_task in tasks),
                    sleep_time=self.def_sleep_time, time_out=self.def_timeout)
 
@@ -417,7 +451,7 @@ class TestRunner(object):
                 self.fail(str(task.poll_exception()))
 
     def _assert_instance_states(self, instance_id, expected_states,
-                                fast_fail_status=['ERROR', 'FAILED'],
+                                fast_fail_status=None,
                                 require_all_states=False):
         """Keep polling for the expected instance states until the instance
         acquires either the last or fast-fail state.
@@ -428,6 +462,11 @@ class TestRunner(object):
         state.
         """
 
+        self.report.log("Waiting for states (%s) for instance: %s" %
+                        (expected_states, instance_id))
+
+        if fast_fail_status is None:
+            fast_fail_status = ['ERROR', 'FAILED']
         found = False
         for status in expected_states:
             if require_all_states or found or self._has_status(
@@ -440,8 +479,9 @@ class TestRunner(object):
                         fast_fail_status=fast_fail_status),
                         sleep_time=self.def_sleep_time,
                         time_out=self.def_timeout)
-                    self.report.log("Instance has gone '%s' in %s." %
-                                    (status, self._time_since(start_time)))
+                    self.report.log("Instance '%s' has gone '%s' in %s." %
+                                    (instance_id, status,
+                                     self._time_since(start_time)))
                 except exception.PollTimeOut:
                     self.report.log(
                         "Status of instance '%s' did not change to '%s' "
@@ -470,10 +510,17 @@ class TestRunner(object):
                           "list section.")
 
     def _wait_all_deleted(self, instance_ids, expected_last_status):
-        tasks = [build_polling_task(
-            lambda: self._wait_for_delete(instance_id, expected_last_status),
-            sleep_time=self.def_sleep_time, time_out=self.def_timeout)
-            for instance_id in instance_ids]
+        self.report.log("Waiting for instances to be gone: %s (status %s)" %
+                        (instance_ids, expected_last_status))
+
+        def _make_fn(inst_id):
+            return lambda: self._wait_for_delete(inst_id, expected_last_status)
+
+        tasks = [
+            build_polling_task(
+                _make_fn(instance_id),
+                sleep_time=self.def_sleep_time,
+                time_out=self.def_timeout) for instance_id in instance_ids]
         poll_until(lambda: all(poll_task.ready() for poll_task in tasks),
                    sleep_time=self.def_sleep_time, time_out=self.def_timeout)
 
@@ -486,13 +533,14 @@ class TestRunner(object):
                 self.fail(str(task.poll_exception()))
 
     def _wait_for_delete(self, instance_id, expected_last_status):
+        self.report.log("Waiting for instance to be gone: %s (status %s)" %
+                        (instance_id, expected_last_status))
         start_time = timer.time()
         try:
             self._poll_while(instance_id, expected_last_status,
                              sleep_time=self.def_sleep_time,
                              time_out=self.def_timeout)
         except exceptions.NotFound:
-            self.assert_client_code(404)
             self.report.log("Instance was removed in %s." %
                             self._time_since(start_time))
             return True
@@ -518,8 +566,53 @@ class TestRunner(object):
                                % (instance_id, instance.status))
         return instance.status == status
 
-    def get_instance(self, instance_id):
-        return self.auth_client.instances.get(instance_id)
+    def get_server(self, instance_id):
+        server = None
+        if instance_id in self._servers:
+            server = self._servers[instance_id]
+        else:
+            instance = self.get_instance(instance_id)
+            self.report.log("Getting server for instance: %s" % instance)
+            for nova_server in self.nova_client.servers.list():
+                if str(nova_server.name) == instance.name:
+                    server = nova_server
+                    break
+            if server:
+                self._servers[instance_id] = server
+        return server
+
+    def assert_server_group_exists(self, instance_id):
+        """Check that the Nova instance associated with instance_id
+        belongs to a server group, and return the id.
+        """
+        server = self.get_server(instance_id)
+        self.assert_is_not_none(server, "Could not find Nova server for '%s'" %
+                                instance_id)
+        server_group = None
+        server_groups = self.nova_client.server_groups.list()
+        for sg in server_groups:
+            if server.id in sg.members:
+                server_group = sg
+                break
+        if server_group is None:
+            self.fail("Could not find server group for Nova instance %s" %
+                      server.id)
+        return server_group.id
+
+    def assert_server_group_gone(self, srv_grp_id):
+        """Ensure that the server group is no longer present."""
+        server_group = None
+        server_groups = self.nova_client.server_groups.list()
+        for sg in server_groups:
+            if sg.id == srv_grp_id:
+                server_group = sg
+                break
+        if server_group:
+            self.fail("Found left-over server group: %s" % server_group)
+
+    def get_instance(self, instance_id, client=None):
+        client = client or self.auth_client
+        return client.instances.get(instance_id)
 
     def get_instance_host(self, instance_id=None):
         instance_id = instance_id or self.instance_info.id
@@ -540,6 +633,25 @@ class TestRunner(object):
         self.assert_is_not_none(flavor, "Flavor '%s' not found." % flavor_name)
 
         return flavor
+
+    def get_instance_flavor(self, fault_num=None):
+        name_format = 'instance%s%s_flavor_name'
+        default = 'm1.tiny'
+        fault_str = ''
+        eph_str = ''
+        if fault_num:
+            fault_str = '_fault_%d' % fault_num
+        if self.EPHEMERAL_SUPPORT:
+            eph_str = '_eph'
+            default = 'eph.rd-tiny'
+
+        name = name_format % (fault_str, eph_str)
+        flavor_name = CONFIG.values.get(name, default)
+
+        return self.get_flavor(flavor_name)
+
+    def get_flavor_href(self, flavor):
+        return self.auth_client.find_flavor_self_href(flavor)
 
     def copy_dict(self, d, ignored_keys=None):
         return {k: v for k, v in d.items()
@@ -705,3 +817,16 @@ class CheckInstance(AttrCheck):
                     slave, allowed_attrs,
                     msg="Replica links not found")
                 self.links(slave['links'])
+
+    def fault(self, is_admin=False):
+        if 'fault' not in self.instance:
+            self.fail("'fault' not found in instance.")
+        else:
+            allowed_attrs = ['message', 'created', 'details']
+            self.contains_allowed_attrs(
+                self.instance['fault'], allowed_attrs,
+                msg="Fault")
+            if is_admin and not self.instance['fault']['details']:
+                self.fail("Missing fault details")
+            if not is_admin and self.instance['fault']['details']:
+                self.fail("Fault details provided for non-admin")

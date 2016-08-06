@@ -73,9 +73,19 @@ function create_trove_accounts {
 # cleanup_trove() - Remove residual data files, anything left over from previous
 # runs that a clean run would need to clean up
 function cleanup_trove {
-    #Clean up dirs
+    # Clean up dirs
     rm -fr $TROVE_AUTH_CACHE_DIR/*
     rm -fr $TROVE_CONF_DIR/*
+
+    if is_service_enabled horizon; then
+        cleanup_trove_dashboard
+    fi
+}
+
+
+# cleanup_trove_dashboard() - Remove Trove dashboard files from Horizon
+function cleanup_trove_dashboard {
+    rm -f $HORIZON_DIR/openstack_dashboard/local/enabled/_17*database*.py
 }
 
 
@@ -115,8 +125,12 @@ function configure_trove {
         iniset_conditional $TROVE_CONF DEFAULT max_instances_per_tenant $TROVE_MAX_INSTANCES_PER_TENANT
         iniset_conditional $TROVE_CONF DEFAULT max_volumes_per_tenant $TROVE_MAX_VOLUMES_PER_TENANT
 
-        iniset $TROVE_CONF DEFAULT rabbit_userid $RABBIT_USERID
-        iniset $TROVE_CONF DEFAULT rabbit_password $RABBIT_PASSWORD
+        iniset $TROVE_CONF DEFAULT rpc_backend "rabbit"
+        iniset $TROVE_CONF oslo_messaging_rabbit rabbit_hosts $RABBIT_HOST
+        iniset $TROVE_CONF oslo_messaging_rabbit rabbit_password $RABBIT_PASSWORD
+        iniset $TROVE_CONF oslo_messaging_rabbit rabbit_userid $RABBIT_USERID
+
+
         iniset $TROVE_CONF database connection `database_connection_url trove`
         iniset $TROVE_CONF DEFAULT default_datastore $TROVE_DATASTORE_TYPE
         setup_trove_logging $TROVE_CONF
@@ -136,8 +150,11 @@ function configure_trove {
         iniset_conditional $TROVE_TASKMANAGER_CONF DEFAULT usage_timeout $TROVE_USAGE_TIMEOUT
         iniset_conditional $TROVE_TASKMANAGER_CONF DEFAULT state_change_wait_time $TROVE_STATE_CHANGE_WAIT_TIME
 
-        iniset $TROVE_TASKMANAGER_CONF DEFAULT rabbit_userid $RABBIT_USERID
-        iniset $TROVE_TASKMANAGER_CONF DEFAULT rabbit_password $RABBIT_PASSWORD
+        iniset $TROVE_TASKMANAGER_CONF DEFAULT rpc_backend "rabbit"
+        iniset $TROVE_TASKMANAGER_CONF oslo_messaging_rabbit rabbit_hosts $RABBIT_HOST
+        iniset $TROVE_TASKMANAGER_CONF oslo_messaging_rabbit rabbit_password $RABBIT_PASSWORD
+        iniset $TROVE_TASKMANAGER_CONF oslo_messaging_rabbit rabbit_userid $RABBIT_USERID
+
         iniset $TROVE_TASKMANAGER_CONF database connection `database_connection_url trove`
         iniset $TROVE_TASKMANAGER_CONF DEFAULT taskmanager_manager trove.taskmanager.manager.Manager
         iniset $TROVE_TASKMANAGER_CONF DEFAULT nova_proxy_admin_user radmin
@@ -149,8 +166,11 @@ function configure_trove {
 
     # (Re)create trove conductor conf file if needed
     if is_service_enabled tr-cond; then
-        iniset $TROVE_CONDUCTOR_CONF DEFAULT rabbit_userid $RABBIT_USERID
-        iniset $TROVE_CONDUCTOR_CONF DEFAULT rabbit_password $RABBIT_PASSWORD
+        iniset $TROVE_CONDUCTOR_CONF DEFAULT rpc_backend "rabbit"
+        iniset $TROVE_CONDUCTOR_CONF oslo_messaging_rabbit rabbit_hosts $RABBIT_HOST
+        iniset $TROVE_CONDUCTOR_CONF oslo_messaging_rabbit rabbit_password $RABBIT_PASSWORD
+        iniset $TROVE_CONDUCTOR_CONF oslo_messaging_rabbit rabbit_userid $RABBIT_USERID
+
         iniset $TROVE_CONDUCTOR_CONF database connection `database_connection_url trove`
         iniset $TROVE_CONDUCTOR_CONF DEFAULT nova_proxy_admin_user radmin
         iniset $TROVE_CONDUCTOR_CONF DEFAULT nova_proxy_admin_tenant_name trove
@@ -164,9 +184,12 @@ function configure_trove {
     iniset_conditional $TROVE_GUESTAGENT_CONF DEFAULT state_change_wait_time $TROVE_STATE_CHANGE_WAIT_TIME
 
     # Set up Guest Agent conf
-    iniset $TROVE_GUESTAGENT_CONF DEFAULT rabbit_userid $RABBIT_USERID
-    iniset $TROVE_GUESTAGENT_CONF DEFAULT rabbit_host $TROVE_HOST_GATEWAY
-    iniset $TROVE_GUESTAGENT_CONF DEFAULT rabbit_password $RABBIT_PASSWORD
+    iniset $TROVE_GUESTAGENT_CONF DEFAULT rpc_backend "rabbit"
+
+    iniset $TROVE_GUESTAGENT_CONF oslo_messaging_rabbit rabbit_password $RABBIT_PASSWORD
+    iniset $TROVE_GUESTAGENT_CONF oslo_messaging_rabbit rabbit_userid $RABBIT_USERID
+    iniset $TROVE_GUESTAGENT_CONF oslo_messaging_rabbit rabbit_hosts $TROVE_HOST_GATEWAY
+
     iniset $TROVE_GUESTAGENT_CONF DEFAULT nova_proxy_admin_user radmin
     iniset $TROVE_GUESTAGENT_CONF DEFAULT nova_proxy_admin_tenant_name trove
     iniset $TROVE_GUESTAGENT_CONF DEFAULT nova_proxy_admin_pass $RADMIN_USER_PASS
@@ -181,13 +204,24 @@ function configure_trove {
 # install_trove() - Collect source and prepare
 function install_trove {
     setup_develop $TROVE_DIR
+
+    if is_service_enabled horizon; then
+        install_trove_dashboard
+    fi
+}
+
+# install_trove_dashboard() - Collect source and prepare
+function install_trove_dashboard {
+    git_clone $TROVE_DASHBOARD_REPO $TROVE_DASHBOARD_DIR $TROVE_DASHBOARD_BRANCH
+    setup_develop $TROVE_DASHBOARD_DIR
+    cp $TROVE_DASHBOARD_DIR/trove_dashboard/enabled/_17*database*.py $HORIZON_DIR/openstack_dashboard/local/enabled
 }
 
 # install_python_troveclient() - Collect source and prepare
 function install_python_troveclient {
     if use_library_from_git "python-troveclient"; then
-        git_clone $TROVECLIENT_REPO $TROVECLIENT_DIR $TROVECLIENT_BRANCH
-        setup_develop $TROVECLIENT_DIR
+        git_clone $TROVE_CLIENT_REPO $TROVE_CLIENT_DIR $TROVE_CLIENT_BRANCH
+        setup_develop $TROVE_CLIENT_DIR
     fi
 }
 
@@ -260,7 +294,18 @@ function finalize_trove_network {
     iniset $TROVE_CONF DEFAULT network_driver trove.network.neutron.NeutronDriver
 
     iniset $TROVE_TASKMANAGER_CONF DEFAULT network_driver trove.network.neutron.NeutronDriver
+    iniset $TROVE_TASKMANAGER_CONF cassandra tcp_ports 22,7000,7001,7199,9042,9160
+    iniset $TROVE_TASKMANAGER_CONF couchbase tcp_ports 22,8091,8092,4369,11209-11211,21100-21199
+    iniset $TROVE_TASKMANAGER_CONF couchdb tcp_ports 22,5984
+    iniset $TROVE_TASKMANAGER_CONF db2 tcp_ports 22,50000
+    iniset $TROVE_TASKMANAGER_CONF mariadb tcp_ports 22,3306,4444,4567,4568
+    iniset $TROVE_TASKMANAGER_CONF mongodb tcp_ports 22,2500,27017,27019
     iniset $TROVE_TASKMANAGER_CONF mysql tcp_ports 22,3306
+    iniset $TROVE_TASKMANAGER_CONF percona tcp_ports 22,3306
+    iniset $TROVE_TASKMANAGER_CONF postgresql tcp_ports 22,5432
+    iniset $TROVE_TASKMANAGER_CONF pxc tcp_ports 22,3306,4444,4567,4568
+    iniset $TROVE_TASKMANAGER_CONF redis tcp_ports 22,6379,16379
+    iniset $TROVE_TASKMANAGER_CONF vertica tcp_ports 22,5433,5434,5444,5450,4803
 }
 
 # start_trove() - Start running processes, including screen
@@ -285,7 +330,6 @@ if is_service_enabled trove; then
         echo_summary "Installing Trove"
         install_trove
         install_python_troveclient
-        cleanup_trove
     elif [[ "$1" == "stack" && "$2" == "post-config" ]]; then
         echo_summary "Configuring Trove"
         configure_trove
@@ -315,6 +359,7 @@ if is_service_enabled trove; then
 
     if [[ "$1" == "unstack" ]]; then
         stop_trove
+        cleanup_trove
     fi
 fi
 

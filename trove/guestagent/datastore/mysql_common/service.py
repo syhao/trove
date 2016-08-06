@@ -24,6 +24,8 @@ import six
 import uuid
 
 from oslo_log import log as logging
+from oslo_utils import encodeutils
+from six.moves import urllib
 import sqlalchemy
 from sqlalchemy import exc
 from sqlalchemy import interfaces
@@ -47,6 +49,7 @@ from trove.guestagent.db import models
 from trove.guestagent import pkg
 
 ADMIN_USER_NAME = "os_admin"
+CONNECTION_STR_FORMAT = "mysql+pymysql://%s:%s@127.0.0.1:3306"
 LOG = logging.getLogger(__name__)
 FLUSH = text(sql_query.FLUSH)
 ENGINE = None
@@ -362,9 +365,10 @@ class BaseMySqlAdmin(object):
             user.name = username  # Could possibly throw a BadRequest here.
         except ValueError as ve:
             LOG.exception(_("Error Getting user information"))
+            err_msg = encodeutils.exception_to_unicode(ve)
             raise exception.BadRequest(_("Username %(user)s is not valid"
                                          ": %(reason)s") %
-                                       {'user': username, 'reason': ve.message}
+                                       {'user': username, 'reason': err_msg}
                                        )
         with self.local_sql_client(self.mysql_app.get_engine()) as client:
             q = sql_query.Query()
@@ -463,7 +467,7 @@ class BaseMySqlAdmin(object):
                 mysql_db.collate = database[2]
                 databases.append(mysql_db.serialize())
         LOG.debug("databases = " + str(databases))
-        if database_names.rowcount <= limit:
+        if limit is not None and database_names.rowcount <= limit:
             next_marker = None
         return databases, next_marker
 
@@ -527,7 +531,7 @@ class BaseMySqlAdmin(object):
                 self._associate_dbs(mysql_user)
                 next_marker = row['Marker']
                 users.append(mysql_user.serialize())
-        if result.rowcount <= limit:
+        if limit is not None and result.rowcount <= limit:
             next_marker = None
         LOG.debug("users = " + str(users))
 
@@ -588,9 +592,13 @@ class BaseMySqlApp(object):
         return self._keep_alive_connection_cls
 
     @property
+    def service_candidates(self):
+        return ["mysql", "mysqld", "mysql-server"]
+
+    @property
     def mysql_service(self):
-        MYSQL_SERVICE_CANDIDATES = ["mysql", "mysqld", "mysql-server"]
-        return operating_system.service_discovery(MYSQL_SERVICE_CANDIDATES)
+        service_candidates = self.service_candidates
+        return operating_system.service_discovery(service_candidates)
 
     configuration_manager = ConfigurationManager(
         MYSQL_CONFIG, MYSQL_OWNER, MYSQL_OWNER, CFG_CODEC, requires_root=True,
@@ -606,13 +614,11 @@ class BaseMySqlApp(object):
             return ENGINE
 
         pwd = self.get_auth_password()
-        ENGINE = sqlalchemy.create_engine("mysql://%s:%s@localhost:3306" %
-                                          (ADMIN_USER_NAME, pwd.strip()),
-                                          pool_recycle=7200,
-                                          echo=CONF.sql_query_logging,
-                                          listeners=[
-                                              self.keep_alive_connection_cls()]
-                                          )
+        ENGINE = sqlalchemy.create_engine(
+            CONNECTION_STR_FORMAT % (ADMIN_USER_NAME,
+                                     urllib.parse.quote(pwd.strip())),
+            pool_recycle=120, echo=CONF.sql_query_logging,
+            listeners=[self.keep_alive_connection_cls()])
         return ENGINE
 
     @classmethod
@@ -647,11 +653,13 @@ class BaseMySqlApp(object):
         Create a os_admin user with a random password
         with all privileges similar to the root user.
         """
+        LOG.debug("Creating Trove admin user '%s'." % ADMIN_USER_NAME)
         localhost = "localhost"
         g = sql_query.Grant(permissions='ALL', user=ADMIN_USER_NAME,
                             host=localhost, grant_option=True, clear=password)
         t = text(str(g))
         client.execute(t)
+        LOG.debug("Trove admin user '%s' created." % ADMIN_USER_NAME)
 
     @staticmethod
     def _generate_root_password(client):
@@ -679,20 +687,26 @@ class BaseMySqlApp(object):
         self.start_mysql()
 
     def secure(self, config_contents):
-        LOG.info(_("Generating admin password."))
-        admin_password = utils.generate_random_password()
+        LOG.debug("Securing MySQL now.")
         clear_expired_password()
-        engine = sqlalchemy.create_engine("mysql://root:@localhost:3306",
-                                          echo=True)
-        with self.local_sql_client(engine) as client:
-            self._remove_anonymous_user(client)
+        LOG.debug("Generating admin password.")
+        admin_password = utils.generate_random_password()
+        engine = sqlalchemy.create_engine(
+            CONNECTION_STR_FORMAT % ('root', ''), echo=True)
+        with self.local_sql_client(engine, use_flush=False) as client:
             self._create_admin_user(client, admin_password)
 
-        self.stop_db()
+        LOG.debug("Switching to the '%s' user now." % ADMIN_USER_NAME)
+        engine = sqlalchemy.create_engine(
+            CONNECTION_STR_FORMAT % (ADMIN_USER_NAME,
+                                     urllib.parse.quote(admin_password)),
+            echo=True)
+        with self.local_sql_client(engine) as client:
+            self._remove_anonymous_user(client)
 
+        self.stop_db()
         self._reset_configuration(config_contents, admin_password)
         self.start_mysql()
-
         LOG.debug("MySQL secure complete.")
 
     def _reset_configuration(self, configuration, admin_password=None):
@@ -773,12 +787,16 @@ class BaseMySqlApp(object):
             raise RuntimeError("Could not stop MySQL!")
 
     def _remove_anonymous_user(self, client):
+        LOG.debug("Removing anonymous user.")
         t = text(sql_query.REMOVE_ANON)
         client.execute(t)
+        LOG.debug("Anonymous user removed.")
 
     def _remove_remote_root_access(self, client):
+        LOG.debug("Removing root access.")
         t = text(sql_query.REMOVE_ROOT)
         client.execute(t)
+        LOG.debug("Root access removed.")
 
     def restart(self):
         try:
@@ -1037,7 +1055,7 @@ class BaseMySqlRootAccess(object):
                 cu = sql_query.CreateUser(user.name, host=user.host)
                 t = text(str(cu))
                 client.execute(t, **cu.keyArgs)
-            except exc.OperationalError as err:
+            except (exc.OperationalError, exc.InternalError) as err:
                 # Ignore, user is already created, just reset the password
                 # TODO(rnirmal): More fine grained error checking later on
                 LOG.debug(err)

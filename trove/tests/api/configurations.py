@@ -167,8 +167,8 @@ class ConfigurationsTestBase(object):
         """Returns the expected test configurations for the default datastore
         defined in the Test Config as dbaas_datastore.
         """
-        default_datatstore = CONFIG.get('dbaas_datastore', None)
-        datastore_test_configs = CONFIG.get(default_datatstore, {})
+        default_datastore = CONFIG.get('dbaas_datastore', None)
+        datastore_test_configs = CONFIG.get(default_datastore, {})
         return datastore_test_configs.get("configurations", {})
 
 
@@ -250,7 +250,7 @@ class CreateConfigurations(ConfigurationsTestBase):
 
     @test
     def test_configurations_create_invalid_value_type(self):
-        """Test create configuration with invalild value type."""
+        """Test create configuration with invalid value type."""
         values = '{"key_buffer_size": "this is a string not int"}'
         assert_unprocessable(instance_info.dbaas.configurations.create,
                              CONFIG_NAME, values, CONFIG_DESC)

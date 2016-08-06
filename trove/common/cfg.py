@@ -26,6 +26,7 @@ from osprofiler import opts as profiler
 from trove.version import version_info as version
 
 
+LOG = logging.getLogger(__name__)
 UNKNOWN_SERVICE_ID = 'unknown-service-id-error'
 
 path_opts = [
@@ -52,34 +53,34 @@ common_opts = [
                      'configured usage_timeout.'),
     cfg.StrOpt('os_region_name', default='RegionOne',
                help='Region name of this node. Used when searching catalog.'),
-    cfg.StrOpt('nova_compute_url', help='URL without the tenant segment.'),
+    cfg.URIOpt('nova_compute_url', help='URL without the tenant segment.'),
     cfg.StrOpt('nova_compute_service_type', default='compute',
                help='Service type to use when searching catalog.'),
     cfg.StrOpt('nova_compute_endpoint_type', default='publicURL',
                help='Service endpoint type to use when searching catalog.'),
     cfg.StrOpt('nova_client_version', default='2.12',
                help="The version of the compute service client."),
-    cfg.StrOpt('neutron_url', help='URL without the tenant segment.'),
+    cfg.URIOpt('neutron_url', help='URL without the tenant segment.'),
     cfg.StrOpt('neutron_service_type', default='network',
                help='Service type to use when searching catalog.'),
     cfg.StrOpt('neutron_endpoint_type', default='publicURL',
                help='Service endpoint type to use when searching catalog.'),
-    cfg.StrOpt('cinder_url', help='URL without the tenant segment.'),
+    cfg.URIOpt('cinder_url', help='URL without the tenant segment.'),
     cfg.StrOpt('cinder_service_type', default='volumev2',
                help='Service type to use when searching catalog.'),
     cfg.StrOpt('cinder_endpoint_type', default='publicURL',
                help='Service endpoint type to use when searching catalog.'),
-    cfg.StrOpt('heat_url', help='URL without the tenant segment.'),
+    cfg.URIOpt('heat_url', help='URL without the tenant segment.'),
     cfg.StrOpt('heat_service_type', default='orchestration',
                help='Service type to use when searching catalog.'),
     cfg.StrOpt('heat_endpoint_type', default='publicURL',
                help='Service endpoint type to use when searching catalog.'),
-    cfg.StrOpt('swift_url', help='URL ending in AUTH_.'),
+    cfg.URIOpt('swift_url', help='URL ending in AUTH_.'),
     cfg.StrOpt('swift_service_type', default='object-store',
                help='Service type to use when searching catalog.'),
     cfg.StrOpt('swift_endpoint_type', default='publicURL',
                help='Service endpoint type to use when searching catalog.'),
-    cfg.StrOpt('trove_auth_url', default='http://0.0.0.0:5000/v2.0',
+    cfg.URIOpt('trove_auth_url', default='http://0.0.0.0:5000/v2.0',
                help='Trove authentication URL.'),
     cfg.IPOpt('host', default='0.0.0.0',
               help='Host to listen for RPC messages.'),
@@ -95,17 +96,17 @@ common_opts = [
     cfg.StrOpt('dns_instance_entry_factory',
                default='trove.dns.driver.DnsInstanceEntryFactory',
                help='Factory for adding DNS entries.'),
-    cfg.StrOpt('dns_hostname', default="",
-               help='Hostname used for adding DNS entries.'),
+    cfg.HostnameOpt('dns_hostname', default="localhost",
+                    help='Hostname used for adding DNS entries.'),
     cfg.StrOpt('dns_account_id', default="",
                help='Tenant ID for DNSaaS.'),
-    cfg.StrOpt('dns_endpoint_url', default="0.0.0.0",
+    cfg.URIOpt('dns_endpoint_url', default="http://0.0.0.0",
                help='Endpoint URL for DNSaaS.'),
     cfg.StrOpt('dns_service_type', default="",
                help='Service Type for DNSaaS.'),
     cfg.StrOpt('dns_region', default="",
                help='Region name for DNSaaS.'),
-    cfg.StrOpt('dns_auth_url', default="",
+    cfg.URIOpt('dns_auth_url', default="http://0.0.0.0",
                help='Authentication URL for DNSaaS.'),
     cfg.StrOpt('dns_domain_name', default="",
                help='Domain name used for adding DNS entries.'),
@@ -113,7 +114,7 @@ common_opts = [
                help='Username for DNSaaS.'),
     cfg.StrOpt('dns_passkey', default="", secret=True,
                help='Passkey for DNSaaS.'),
-    cfg.StrOpt('dns_management_base_url', default="",
+    cfg.URIOpt('dns_management_base_url', default="http://0.0.0.0",
                help='Management URL for DNSaaS.'),
     cfg.IntOpt('dns_ttl', default=300,
                help='Time (in seconds) before a refresh of DNS information '
@@ -402,7 +403,7 @@ common_opts = [
                     'become alive.'),
     cfg.StrOpt('module_aes_cbc_key', default='module_aes_cbc_key',
                help='OpenSSL aes_cbc key for module encryption.'),
-    cfg.ListOpt('module_types', default=['ping'],
+    cfg.ListOpt('module_types', default=['ping', 'new_relic_license'],
                 help='A list of module types supported. A module type '
                      'corresponds to the name of a ModuleDriver.'),
     cfg.StrOpt('guest_log_container_name',
@@ -479,6 +480,8 @@ mysql_group = cfg.OptGroup(
     'mysql', title='MySQL options',
     help="Oslo option group designed for MySQL datastore")
 mysql_opts = [
+    cfg.BoolOpt('icmp', default=False,
+                help='Whether to permit ICMP.'),
     cfg.ListOpt('tcp_ports', default=["3306"],
                 help='List of TCP ports and/or port ranges to open '
                      'in the security group (only applicable '
@@ -557,6 +560,8 @@ percona_group = cfg.OptGroup(
     'percona', title='Percona options',
     help="Oslo option group designed for Percona datastore")
 percona_opts = [
+    cfg.BoolOpt('icmp', default=False,
+                help='Whether to permit ICMP.'),
     cfg.ListOpt('tcp_ports', default=["3306"],
                 help='List of TCP ports and/or port ranges to open '
                      'in the security group (only applicable '
@@ -728,6 +733,8 @@ redis_group = cfg.OptGroup(
     'redis', title='Redis options',
     help="Oslo option group designed for Redis datastore")
 redis_opts = [
+    cfg.BoolOpt('icmp', default=False,
+                help='Whether to permit ICMP.'),
     cfg.ListOpt('tcp_ports', default=["6379", "16379"],
                 help='List of TCP ports and/or port ranges to open '
                      'in the security group (only applicable '
@@ -803,6 +810,8 @@ cassandra_group = cfg.OptGroup(
     'cassandra', title='Cassandra options',
     help="Oslo option group designed for Cassandra datastore")
 cassandra_opts = [
+    cfg.BoolOpt('icmp', default=False,
+                help='Whether to permit ICMP.'),
     cfg.ListOpt('tcp_ports', default=["7000", "7001", "7199", "9042", "9160"],
                 help='List of TCP ports and/or port ranges to open '
                      'in the security group (only applicable '
@@ -880,6 +889,8 @@ couchbase_group = cfg.OptGroup(
     'couchbase', title='Couchbase options',
     help="Oslo option group designed for Couchbase datastore")
 couchbase_opts = [
+    cfg.BoolOpt('icmp', default=False,
+                help='Whether to permit ICMP.'),
     cfg.ListOpt('tcp_ports',
                 default=["8091", "8092", "4369", "11209-11211",
                          "21100-21199"],
@@ -942,6 +953,8 @@ mongodb_group = cfg.OptGroup(
     'mongodb', title='MongoDB options',
     help="Oslo option group designed for MongoDB datastore")
 mongodb_opts = [
+    cfg.BoolOpt('icmp', default=False,
+                help='Whether to permit ICMP.'),
     cfg.ListOpt('tcp_ports', default=["2500", "27017", "27019"],
                 help='List of TCP ports and/or port ranges to open '
                      'in the security group (only applicable '
@@ -1033,6 +1046,8 @@ postgresql_group = cfg.OptGroup(
     'postgresql', title='PostgreSQL options',
     help="Oslo option group for the PostgreSQL datastore.")
 postgresql_opts = [
+    cfg.BoolOpt('icmp', default=False,
+                help='Whether to permit ICMP.'),
     cfg.ListOpt('tcp_ports', default=["5432"],
                 help='List of TCP ports and/or port ranges to open '
                      'in the security group (only applicable '
@@ -1043,15 +1058,20 @@ postgresql_opts = [
                      'if trove_security_groups_support is True).'),
     cfg.PortOpt('postgresql_port', default=5432,
                 help='The TCP port the server listens on.'),
-    cfg.StrOpt('backup_strategy', default='PgDump',
+    cfg.StrOpt('backup_strategy', default='PgBaseBackup',
                help='Default strategy to perform backups.'),
-    cfg.DictOpt('backup_incremental_strategy', default={},
+    cfg.DictOpt('backup_incremental_strategy',
+                default={'PgBaseBackup': 'PgBaseBackupIncremental'},
                 help='Incremental Backup Runner based on the default '
                 'strategy. For strategies that do not implement an '
                 'incremental, the runner will use the default full backup.'),
     cfg.StrOpt('mount_point', default='/var/lib/postgresql',
                help="Filesystem path for mounting "
                "volumes if volume support is enabled."),
+    cfg.StrOpt('wal_archive_location', default='/mnt/wal_archive',
+               help="Filesystem path storing WAL archive files when "
+                    "WAL-shipping based backups or replication "
+                    "is enabled."),
     cfg.BoolOpt('root_on_create', default=False,
                 help='Enable the automatic creation of the root user for the '
                 'service during instance-create. The generated password for '
@@ -1092,6 +1112,8 @@ couchdb_group = cfg.OptGroup(
     'couchdb', title='CouchDB options',
     help="Oslo option group designed for CouchDB datastore")
 couchdb_opts = [
+    cfg.BoolOpt('icmp', default=False,
+                help='Whether to permit ICMP.'),
     cfg.ListOpt('tcp_ports',
                 default=["5984"],
                 help='List of TCP ports and/or port ranges to open '
@@ -1152,6 +1174,8 @@ vertica_group = cfg.OptGroup(
     'vertica', title='Vertica options',
     help="Oslo option group designed for Vertica datastore")
 vertica_opts = [
+    cfg.BoolOpt('icmp', default=False,
+                help='Whether to permit ICMP.'),
     cfg.ListOpt('tcp_ports',
                 default=["5433", "5434", "22", "5444", "5450", "4803"],
                 help='List of TCP ports and/or port ranges to open '
@@ -1220,6 +1244,8 @@ db2_group = cfg.OptGroup(
     'db2', title='DB2 options',
     help="Oslo option group designed for DB2 datastore")
 db2_opts = [
+    cfg.BoolOpt('icmp', default=False,
+                help='Whether to permit ICMP.'),
     cfg.ListOpt('tcp_ports',
                 default=["50000"],
                 help='List of TCP ports and/or port ranges to open '
@@ -1286,7 +1312,7 @@ mariadb_opts = [
                 help='List of UDP ports and/or port ranges to open '
                      'in the security group (only applicable '
                      'if trove_security_groups_support is True).'),
-    cfg.StrOpt('backup_strategy', default='InnoBackupEx',
+    cfg.StrOpt('backup_strategy', default='MariaDBInnoBackupEx',
                help='Default strategy to perform backups.',
                deprecated_name='backup_strategy',
                deprecated_group='DEFAULT'),
@@ -1308,12 +1334,14 @@ mariadb_opts = [
                help='Maximum time (in seconds) to wait for a Guest to become '
                     'active.'),
     cfg.StrOpt('backup_namespace',
-               default='trove.guestagent.strategies.backup.mysql_impl',
+               default='trove.guestagent.strategies.backup.experimental'
+                       '.mariadb_impl',
                help='Namespace to load backup strategies from.',
                deprecated_name='backup_namespace',
                deprecated_group='DEFAULT'),
     cfg.StrOpt('restore_namespace',
-               default='trove.guestagent.strategies.restore.mysql_impl',
+               default='trove.guestagent.strategies.restore.experimental'
+                       '.mariadb_impl',
                help='Namespace to load restore strategies from.',
                deprecated_name='restore_namespace',
                deprecated_group='DEFAULT'),
@@ -1322,7 +1350,8 @@ mariadb_opts = [
     cfg.StrOpt('device_path', default='/dev/vdb',
                help='Device path for volume if volume support is enabled.'),
     cfg.DictOpt('backup_incremental_strategy',
-                default={'InnoBackupEx': 'InnoBackupExIncremental'},
+                default={'MariaDBInnoBackupEx':
+                         'MariaDBInnoBackupExIncremental'},
                 help='Incremental Backup Runner based on the default '
                 'strategy. For strategies that do not implement an '
                 'incremental backup, the runner will use the default full '
@@ -1439,35 +1468,35 @@ def parse_args(argv, default_config_files=None):
              default_config_files=default_config_files)
 
 
-def get_ignored_dbs(manager=None):
+def get_ignored_dbs():
     try:
-        return get_configuration_property('ignore_dbs', manager=manager)
+        return get_configuration_property('ignore_dbs')
     except NoSuchOptError:
         return []
 
 
-def get_ignored_users(manager=None):
+def get_ignored_users():
     try:
-        return get_configuration_property('ignore_users', manager=manager)
+        return get_configuration_property('ignore_users')
     except NoSuchOptError:
         return []
 
 
-def get_configuration_property(property_name, manager=None):
+def get_configuration_property(property_name):
     """
     Get a configuration property.
     Try to get it from the datastore-specific section first.
     If it is not available, retrieve it from the DEFAULT section.
     """
 
-    # TODO(pmalik): Note that the unit and fake-integration tests
-    # do not define 'CONF.datastore_manager'. *MySQL* options will
-    # be loaded unless the caller passes a manager name explicitly.
-    #
-    # Once the tests are fixed this conditional expression should be removed
-    # and the proper value should always be either loaded from
-    # 'CONF.datastore_manager' or passed-in by the caller.
-    datastore_manager = manager or CONF.datastore_manager or 'mysql'
+    # Fake-integration tests do not define 'CONF.datastore_manager'.
+    # *MySQL* options will
+    # be loaded. This should never occur in a production environment.
+    datastore_manager = CONF.datastore_manager
+    if not datastore_manager:
+        datastore_manager = 'mysql'
+        LOG.warning(_("Manager name ('datastore_manager') not defined, "
+                      "using '%s' options instead.") % datastore_manager)
 
     try:
         return CONF.get(datastore_manager).get(property_name)

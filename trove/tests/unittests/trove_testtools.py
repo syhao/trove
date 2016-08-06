@@ -20,6 +20,7 @@ import os
 import sys
 import testtools
 
+from trove.common import cfg
 from trove.common.context import TroveContext
 from trove.common.notification import DBaaSAPINotification
 from trove.tests import root_logger
@@ -81,7 +82,6 @@ class TestCase(testtools.TestCase):
         super(TestCase, cls).setUpClass()
 
         cls._dangling_mocks = set()
-        cls._mocks_before = cls._find_mock_refs()
 
         root_logger.DefaultRootLogger(enable_backtrace=False)
 
@@ -98,6 +98,9 @@ class TestCase(testtools.TestCase):
         super(TestCase, self).setUp()
         root_logger.DefaultRootHandler.set_info(self.id())
 
+        # Default manager used by all unittsest unless explicitly overriden.
+        self.patch_datastore_manager('mysql')
+
     def tearDown(self):
         # yes, this is gross and not thread aware.
         # but the only way to make it thread aware would require that
@@ -108,10 +111,8 @@ class TestCase(testtools.TestCase):
     @classmethod
     def _assert_modules_unmocked(cls):
         """Check that all members of loaded modules are currently unmocked.
-        Consider only new mocks created since the last setUp() call.
         """
-        mocks_after = cls._find_mock_refs()
-        new_mocks = mocks_after.difference(cls._mocks_before)
+        new_mocks = cls._find_mock_refs()
         if cls._only_unique:
             # Remove mock references that have already been reported once in
             # this test suite (probably defined in setUp()).
@@ -161,3 +162,16 @@ class TestCase(testtools.TestCase):
     @classmethod
     def _get_loaded_modules(cls):
         return {name: obj for name, obj in sys.modules.items() if obj}
+
+    def patch_datastore_manager(self, manager_name):
+        return self.patch_conf_property('datastore_manager', manager_name)
+
+    def patch_conf_property(self, property_name, value, section=None):
+        target = cfg.CONF
+        if section:
+            target = target.get(section)
+        conf_patcher = mock.patch.object(
+            target, property_name,
+            new_callable=mock.PropertyMock(return_value=value))
+        self.addCleanup(conf_patcher.stop)
+        return conf_patcher.start()

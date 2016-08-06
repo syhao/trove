@@ -144,7 +144,13 @@ class DatastoreVersionInactive(TroveError):
 class DatastoreDefaultDatastoreNotFound(TroveError):
 
     message = _("Please specify datastore. Default datastore "
-                "cannot be found.")
+                "'%(datastore)s' cannot be found.")
+
+
+class DatastoreDefaultDatastoreNotDefined(TroveError):
+
+    message = _("Please specify datastore. No default datastore "
+                "is defined.")
 
 
 class DatastoreDefaultVersionNotFound(TroveError):
@@ -520,6 +526,11 @@ class ModuleAccessForbidden(Forbidden):
 
     message = _("You must be admin to %(action)s a module with these "
                 "options. %(options)s")
+
+
+class ModuleInvalid(Forbidden):
+
+    message = _("The module you are applying is invalid: %(reason)s")
 
 
 class ClusterNotFound(NotFound):

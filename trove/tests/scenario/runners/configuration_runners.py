@@ -506,7 +506,7 @@ class ConfigurationRunner(TestRunner):
     def assert_create_instance_with_conf(self, config_id):
         # test that a new instance will apply the configuration on create
         result = self.auth_client.instances.create(
-            "TEST_" + str(datetime.now()) + "_config",
+            self.instance_info.name + "_config",
             self.instance_info.dbaas_flavor_href,
             self.instance_info.volume,
             [], [],
@@ -537,17 +537,20 @@ class ConfigurationRunner(TestRunner):
         else:
             raise SkipTest("No instance created with a configuration group.")
 
-    def run_delete_conf_instance(
-            self, expected_states=['SHUTDOWN'],
-            expected_http_code=202):
+    def run_delete_conf_instance(self, expected_http_code=202):
         if self.config_inst_id:
             self.assert_delete_conf_instance(
-                self.config_inst_id, expected_states, expected_http_code)
+                self.config_inst_id, expected_http_code)
         else:
             raise SkipTest("No instance created with a configuration group.")
 
-    def assert_delete_conf_instance(
-            self, instance_id, expected_state, expected_http_code):
+    def assert_delete_conf_instance(self, instance_id, expected_http_code):
         self.auth_client.instances.delete(instance_id)
         self.assert_client_code(expected_http_code)
-        self.assert_all_gone(instance_id, expected_state)
+
+    def run_wait_for_delete_conf_instance(
+            self, expected_last_state=['SHUTDOWN']):
+        if self.config_inst_id:
+            self.assert_all_gone(self.config_inst_id, expected_last_state)
+        else:
+            raise SkipTest("No instance created with a configuration group.")

@@ -60,9 +60,10 @@ VOLUME_ID = 'volume-id-1'
 
 class FakeOptGroup(object):
     def __init__(self, tcp_ports=['3306', '3301-3307'],
-                 udp_ports=[]):
+                 udp_ports=[], icmp=False):
         self.tcp_ports = tcp_ports
         self.udp_ports = udp_ports
+        self.icmp = icmp
 
 
 class fake_Server:
@@ -81,7 +82,8 @@ class fake_Server:
 class fake_ServerManager:
     def create(self, name, image_id, flavor_id, files, userdata,
                security_groups, block_device_mapping, availability_zone=None,
-               nics=None, config_drive=False):
+               nics=None, config_drive=False,
+               scheduler_hints=None):
         server = fake_Server()
         server.id = "server_id"
         server.name = name
@@ -193,10 +195,11 @@ class FreshInstanceTasksTest(trove_testtools.TestCase):
         self.orig_DBI_find_by = DBInstance.find_by
         self.userdata = "hello moto"
         self.guestconfig_content = "guest config"
-        with NamedTemporaryFile(suffix=".cloudinit", delete=False) as f:
+        with NamedTemporaryFile(mode="w", suffix=".cloudinit",
+                                delete=False) as f:
             self.cloudinit = f.name
             f.write(self.userdata)
-        with NamedTemporaryFile(delete=False) as f:
+        with NamedTemporaryFile(mode="w", delete=False) as f:
             self.guestconfig = f.name
             f.write(self.guestconfig_content)
         self.freshinstancetasks = taskmanager_models.FreshInstanceTasks(
@@ -366,6 +369,15 @@ class FreshInstanceTasksTest(trove_testtools.TestCase):
                           self.freshinstancetasks._create_secgroup,
                           datastore_manager)
 
+    def test_create_sg_rules_icmp(self):
+        datastore_manager = 'mysql'
+        self.task_models_conf_mock.get = Mock(
+            return_value=FakeOptGroup(icmp=True))
+        self.freshinstancetasks.update_db = Mock()
+        self.freshinstancetasks._create_secgroup(datastore_manager)
+        self.assertEqual(3, taskmanager_models.SecurityGroupRule.
+                         create_sec_group_rule.call_count)
+
     @patch.object(BaseInstance, 'update_db')
     @patch('trove.taskmanager.models.CONF')
     @patch('trove.taskmanager.models.LOG')
@@ -379,7 +391,7 @@ class FreshInstanceTasksTest(trove_testtools.TestCase):
             'Error creating security group for instance',
             self.freshinstancetasks.create_instance, mock_flavor,
             'mysql-image-id', None, None, 'mysql', 'mysql-server', 2,
-            None, None, None, None, Mock(), None, None, None, None)
+            None, None, None, None, Mock(), None, None, None, None, None)
 
     @patch.object(BaseInstance, 'update_db')
     @patch.object(backup_models.Backup, 'get_by_id')
@@ -401,7 +413,7 @@ class FreshInstanceTasksTest(trove_testtools.TestCase):
             self.freshinstancetasks.create_instance, mock_flavor,
             'mysql-image-id', None, None, 'mysql', 'mysql-server',
             2, Mock(), None, 'root_password', None, Mock(), None, None, None,
-            None)
+            None, None)
 
     @patch.object(BaseInstance, 'update_db')
     @patch.object(taskmanager_models.FreshInstanceTasks, '_create_dns_entry')
@@ -416,6 +428,8 @@ class FreshInstanceTasksTest(trove_testtools.TestCase):
                              mock_guest_prepare,
                              mock_build_volume_info,
                              mock_create_secgroup,
+                             mock_create_server,
+                             mock_get_injected_files,
                              *args):
         mock_flavor = {'id': 8, 'ram': 768, 'name': 'bigger_flavor'}
         config_content = {'config_contents': 'some junk'}
@@ -427,13 +441,18 @@ class FreshInstanceTasksTest(trove_testtools.TestCase):
                                                 'mysql-server', 2,
                                                 None, None, None, None,
                                                 overrides, None, None,
-                                                'volume_type', None)
+                                                'volume_type', None,
+                                                {'group': 'sg-id'})
         mock_create_secgroup.assert_called_with('mysql')
         mock_build_volume_info.assert_called_with('mysql', volume_size=2,
                                                   volume_type='volume_type')
         mock_guest_prepare.assert_called_with(
             768, mock_build_volume_info(), 'mysql-server', None, None, None,
             config_content, None, overrides, None, None, None)
+        mock_create_server.assert_called_with(
+            8, 'mysql-image-id', mock_create_secgroup(),
+            'mysql', mock_build_volume_info()['block_device'], None,
+            None, mock_get_injected_files(), {'group': 'sg-id'})
 
     @patch.object(trove.guestagent.api.API, 'attach_replication_slave')
     @patch.object(rpc, 'get_client')
@@ -780,16 +799,38 @@ class BuiltInstanceTasksTest(trove_testtools.TestCase):
 
     @patch.object(BaseInstance, 'update_db')
     def test_detach_replica(self, mock_update_db):
-        self.instance_task.detach_replica(Mock(), True)
-        self.instance_task._guest.detach_replica.assert_called_with(True)
-        mock_update_db.assert_called_with(slave_of_id=None)
+        with patch.object(self.instance_task, 'reset_task_status') as tr_mock:
+            self.instance_task.detach_replica(Mock(), True)
+            self.instance_task._guest.detach_replica.assert_called_with(True)
+            mock_update_db.assert_called_with(slave_of_id=None)
+            tr_mock.assert_not_called()
 
+        with patch.object(self.instance_task, 'reset_task_status') as tr_mock:
+            self.instance_task.detach_replica(Mock(), False)
+            self.instance_task._guest.detach_replica.assert_called_with(False)
+            mock_update_db.assert_called_with(slave_of_id=None)
+            tr_mock.assert_called_once_with()
+
+    @patch.object(BaseInstance, 'update_db')
     @patch('trove.taskmanager.models.LOG')
-    def test_error_detach_replica(self, mock_logging):
-        with patch.object(self.instance_task._guest, 'detach_replica',
-                          side_effect=GuestError):
-            self.assertRaises(GuestError, self.instance_task.detach_replica,
-                              Mock(), True)
+    def test_error_detach_replica(self, mock_logging, mock_update_db):
+        with patch.object(self.instance_task, 'reset_task_status') as tr_mock:
+            with patch.object(self.instance_task._guest, 'detach_replica',
+                              side_effect=GuestError):
+                self.assertRaises(
+                    GuestError, self.instance_task.detach_replica,
+                    Mock(), True)
+                mock_update_db.assert_not_called()
+                tr_mock.assert_not_called()
+
+        with patch.object(self.instance_task, 'reset_task_status') as tr_mock:
+            with patch.object(self.instance_task._guest, 'detach_replica',
+                              side_effect=GuestError):
+                self.assertRaises(
+                    GuestError, self.instance_task.detach_replica,
+                    Mock(), False)
+                mock_update_db.assert_not_called()
+                tr_mock.assert_called_once_with()
 
     @patch.object(BaseInstance, 'update_db')
     def test_make_read_only(self, mock_update_db):

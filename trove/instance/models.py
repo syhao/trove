@@ -26,13 +26,14 @@ from oslo_log import log as logging
 from trove.backup.models import Backup
 from trove.common import cfg
 from trove.common import exception
-from trove.common import i18n as i18n
+from trove.common.i18n import _, _LE, _LI, _LW
 import trove.common.instance as tr_instance
 from trove.common.notification import StartNotification
 from trove.common.remote import create_cinder_client
 from trove.common.remote import create_dns_client
 from trove.common.remote import create_guest_client
 from trove.common.remote import create_nova_client
+from trove.common import server_group as srv_grp
 from trove.common import template
 from trove.common import utils
 from trove.configuration.models import Configuration
@@ -47,8 +48,6 @@ from trove.module import models as module_models
 from trove.module import views as module_views
 from trove.quota.quota import run_with_quotas
 from trove.taskmanager import api as task_api
-
-(_, _LE, _LI, _LW) = (i18n._, i18n._LE, i18n._LI, i18n._LW)
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
@@ -99,6 +98,7 @@ class InstanceStatus(object):
     RESTART_REQUIRED = "RESTART_REQUIRED"
     PROMOTE = "PROMOTE"
     EJECT = "EJECT"
+    DETACH = "DETACH"
 
 
 def validate_volume_size(size):
@@ -152,7 +152,7 @@ class SimpleInstance(object):
     """
 
     def __init__(self, context, db_info, datastore_status, root_password=None,
-                 ds_version=None, ds=None):
+                 ds_version=None, ds=None, locality=None):
         """
         :type context: trove.common.context.TroveContext
         :type db_info: trove.instance.models.DBInstance
@@ -163,12 +163,15 @@ class SimpleInstance(object):
         self.db_info = db_info
         self.datastore_status = datastore_status
         self.root_pass = root_password
+        self._fault = None
+        self._fault_loaded = False
         if ds_version is None:
             self.ds_version = (datastore_models.DatastoreVersion.
                                load_by_uuid(self.db_info.datastore_version_id))
         if ds is None:
             self.ds = (datastore_models.Datastore.
                        load(self.ds_version.datastore_id))
+        self.locality = locality
 
         self.slave_list = None
 
@@ -301,6 +304,8 @@ class SimpleInstance(object):
             return InstanceStatus.EJECT
         if InstanceTasks.LOGGING.action == action:
             return InstanceStatus.LOGGING
+        if InstanceTasks.DETACHING.action == action:
+            return InstanceStatus.DETACH
 
         # Check for server status.
         if self.db_info.server_status in ["BUILD", "ERROR", "REBOOT",
@@ -369,6 +374,20 @@ class SimpleInstance(object):
     @property
     def root_password(self):
         return self.root_pass
+
+    @property
+    def fault(self):
+        # Fault can be non-existent, so we have a loaded flag
+        if not self._fault_loaded:
+            try:
+                self._fault = DBInstanceFault.find_by(instance_id=self.id)
+                # Get rid of the stack trace if we're not admin
+                if not self.context.is_admin:
+                    self._fault.details = None
+            except exception.ModelNotFoundError:
+                pass
+            self._fault_loaded = True
+        return self._fault
 
     @property
     def configuration(self):
@@ -492,7 +511,7 @@ def load_instance(cls, context, id, needs_server=False,
     return cls(context, db_info, server, service_status)
 
 
-def load_instance_with_guest(cls, context, id, cluster_id=None):
+def load_instance_with_info(cls, context, id, cluster_id=None):
     db_info = get_db_info(context, id, cluster_id)
     load_simple_instance_server_status(context, db_info)
     service_status = InstanceServiceStatus.find_by(instance_id=id)
@@ -500,6 +519,7 @@ def load_instance_with_guest(cls, context, id, cluster_id=None):
               {'instance_id': id, 'service_status': service_status.status})
     instance = cls(context, db_info, service_status)
     load_guest_info(instance, context, id)
+    load_server_group_info(instance, context, db_info.compute_instance_id)
     return instance
 
 
@@ -513,6 +533,12 @@ def load_guest_info(instance, context, id):
         except Exception as e:
             LOG.error(e)
     return instance
+
+
+def load_server_group_info(instance, context, compute_id):
+    server_group = srv_grp.ServerGroup.load(context, compute_id)
+    if server_group:
+        instance.locality = srv_grp.ServerGroup.get_locality(server_group)
 
 
 class BaseInstance(SimpleInstance):
@@ -554,6 +580,8 @@ class BaseInstance(SimpleInstance):
         self._guest = None
         self._nova_client = None
         self._volume_client = None
+        self._server_group = None
+        self._server_group_loaded = False
 
     def get_guest(self):
         return create_guest_client(self.context, self.db_info.id)
@@ -598,6 +626,7 @@ class BaseInstance(SimpleInstance):
         self.update_db(deleted=True, deleted_at=deleted_at,
                        task_status=InstanceTasks.NONE)
         self.set_servicestatus_deleted()
+        self.set_instance_fault_deleted()
         # Delete associated security group
         if CONF.trove_security_groups_support:
             SecurityGroup.delete_for_instance(self.db_info.id,
@@ -626,6 +655,15 @@ class BaseInstance(SimpleInstance):
         del_instance.set_status(tr_instance.ServiceStatuses.DELETED)
         del_instance.save()
 
+    def set_instance_fault_deleted(self):
+        try:
+            del_fault = DBInstanceFault.find_by(instance_id=self.id)
+            del_fault.deleted = True
+            del_fault.deleted_at = datetime.utcnow()
+            del_fault.save()
+        except exception.ModelNotFoundError:
+            pass
+
     @property
     def volume_client(self):
         if not self._volume_client:
@@ -636,6 +674,15 @@ class BaseInstance(SimpleInstance):
         LOG.info(_LI("Resetting task status to NONE on instance %s."),
                  self.id)
         self.update_db(task_status=InstanceTasks.NONE)
+
+    @property
+    def server_group(self):
+        # The server group could be empty, so we need a flag to cache it
+        if not self._server_group_loaded:
+            self._server_group = srv_grp.ServerGroup.load(
+                self.context, self.db_info.compute_instance_id)
+            self._server_group_loaded = True
+        return self._server_group
 
 
 class FreshInstance(BaseInstance):
@@ -674,7 +721,8 @@ class Instance(BuiltInstance):
                datastore, datastore_version, volume_size, backup_id,
                availability_zone=None, nics=None,
                configuration_id=None, slave_of_id=None, cluster_config=None,
-               replica_count=None, volume_type=None, modules=None):
+               replica_count=None, volume_type=None, modules=None,
+               locality=None):
 
         call_args = {
             'name': name,
@@ -789,6 +837,8 @@ class Instance(BuiltInstance):
                 "create %(count)d instances.") % {'count': replica_count})
         multi_replica = slave_of_id and replica_count and replica_count > 1
         instance_count = replica_count if multi_replica else 1
+        if locality:
+            call_args['locality'] = locality
 
         if not nics:
             nics = []
@@ -886,10 +936,11 @@ class Instance(BuiltInstance):
                 datastore_version.manager, datastore_version.packages,
                 volume_size, backup_id, availability_zone, root_password,
                 nics, overrides, slave_of_id, cluster_config,
-                volume_type=volume_type, modules=module_list)
+                volume_type=volume_type, modules=module_list,
+                locality=locality)
 
             return SimpleInstance(context, db_info, service_status,
-                                  root_password)
+                                  root_password, locality=locality)
 
         with StartNotification(context, **call_args):
             return run_with_quotas(context.tenant, deltas, _create_resources)
@@ -910,7 +961,7 @@ class Instance(BuiltInstance):
                   "%(ds_version)s and flavor %(flavor)s.",
                   {'ds_version': self.ds_version, 'flavor': flavor})
         config = template.SingleInstanceConfigTemplate(
-            self.ds_version, flavor, id)
+            self.ds_version, flavor, self.id)
         return config.render_dict()
 
     def resize_flavor(self, new_flavor_id):
@@ -1002,6 +1053,9 @@ class Instance(BuiltInstance):
         if not self.slave_of_id:
             raise exception.BadRequest(_("Instance %s is not a replica.")
                                        % self.id)
+
+        self.update_db(task_status=InstanceTasks.DETACHING)
+
         task_api.API(self.context).detach_replica(self.id)
 
     def promote_to_replica_source(self):
@@ -1219,11 +1273,9 @@ class Instances(object):
         if instance_ids and len(instance_ids) > 1:
             raise exception.DatastoreOperationNotSupported(
                 operation='module-instances', datastore='current')
-            db_infos = DBInstance.query().filter_by(**query_opts)
-        else:
-            if instance_ids:
-                query_opts['id'] = instance_ids[0]
-            db_infos = DBInstance.find_all(**query_opts)
+        if instance_ids:
+            query_opts['id'] = instance_ids[0]
+        db_infos = DBInstance.find_all(**query_opts)
         limit = utils.pagination_limit(context.limit, Instances.DEFAULT_LIMIT)
         data_view = DBInstance.find_by_pagination('instances', db_infos, "foo",
                                                   limit=limit,
@@ -1325,6 +1377,54 @@ class DBInstance(dbmodels.DatabaseModelBase):
     task_status = property(get_task_status, set_task_status)
 
 
+def persist_instance_fault(notification, event_qualifier):
+    """This callback is registered to be fired whenever a
+    notification is sent out.
+    """
+    if "error" == event_qualifier:
+        instance_id = notification.payload.get('instance_id')
+        message = notification.payload.get(
+            'message', 'Missing notification message')
+        details = notification.payload.get('exception', [])
+        server_type = notification.server_type
+        if server_type:
+            details.insert(0, "Server type: %s\n" % server_type)
+        save_instance_fault(instance_id, message, details)
+
+
+def save_instance_fault(instance_id, message, details):
+    if instance_id:
+        try:
+            # Make sure it's a valid id - sometimes the error is related
+            # to an invalid id and we can't save those
+            DBInstance.find_by(id=instance_id, deleted=False)
+            msg = utils.format_output(message, truncate_len=255)
+            det = utils.format_output(details)
+            try:
+                fault = DBInstanceFault.find_by(instance_id=instance_id)
+                fault.set_info(msg, det)
+                fault.save()
+            except exception.ModelNotFoundError:
+                DBInstanceFault.create(
+                    instance_id=instance_id,
+                    message=msg, details=det)
+        except exception.ModelNotFoundError:
+            # We don't need to save anything if the instance id isn't valid
+            pass
+
+
+class DBInstanceFault(dbmodels.DatabaseModelBase):
+    _data_fields = ['instance_id', 'message', 'details',
+                    'created', 'updated', 'deleted', 'deleted_at']
+
+    def __init__(self, **kwargs):
+        super(DBInstanceFault, self).__init__(**kwargs)
+
+    def set_info(self, message, details):
+        self.message = message
+        self.details = details
+
+
 class InstanceServiceStatus(dbmodels.DatabaseModelBase):
     _data_fields = ['instance_id', 'status_id', 'status_description',
                     'updated_at']
@@ -1370,6 +1470,7 @@ class InstanceServiceStatus(dbmodels.DatabaseModelBase):
 def persisted_models():
     return {
         'instance': DBInstance,
+        'instance_faults': DBInstanceFault,
         'service_statuses': InstanceServiceStatus,
     }
 
